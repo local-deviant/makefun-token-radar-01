@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token Radar — which pre-token protocol is worth farming next</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand">
+      <h1>Token Radar</h1>
+      <p class="tag">Which pre-token protocol is worth farming next — ranked by what its token would be worth.</p>
+    </div>
+    <div class="meta" id="meta"></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="hero" id="hero" aria-label="Out-of-sample validation"></section>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="board" class="active">Board</button>
+    <button data-tab="trading">Already trading</button>
+    <button data-tab="method">How the value is derived</button>
+  </nav>
+
+  <section id="tab-board" class="tabpage">
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search name or slug…" aria-label="Search">
+      <select id="fcat" aria-label="Category"></select>
+      <select id="fverdict" aria-label="Verdict">
+        <option value="">All verdicts</option>
+        <option value="FARM">FARM only</option>
+        <option value="THIN">THIN only</option>
+        <option value="SKIP">SKIP only</option>
+      </select>
+      <label class="check"><input id="fwatch" type="checkbox"> Watchlist only</label>
+      <select id="sort" aria-label="Sort">
+        <option value="rank">Sort: rank</option>
+        <option value="tvl">Sort: TVL</option>
+        <option value="growth">Sort: 7-day change</option>
+        <option value="age">Sort: age</option>
+        <option value="readiness">Sort: readiness</option>
+      </select>
+    </div>
+    <p class="count" id="count"></p>
+    <div class="tablewrap">
+      <table id="board">
+        <thead>
+          <tr>
+            <th>#</th><th>Protocol</th><th>Category</th><th>TVL</th><th>7d</th>
+            <th>Age</th><th>Implied value</th><th>Multiple</th><th>Verdict</th><th>Readiness</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div id="detail" class="detail" hidden></div>
+  </section>
+
+  <section id="tab-trading" class="tabpage" hidden>
+    <p class="note">These protocols already trade — they are the comparables the model was fitted on, shown with the market's own values, never mixed into the ranking.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>#</th><th>Protocol</th><th>Category</th><th>TVL</th><th>Market cap</th><th>mcap / TVL</th></tr></thead>
+        <tbody id="live"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-method" class="tabpage" hidden>
+    <div id="method"></div>
+    <h2>Fit scatter</h2>
+    <p class="note">Each dot is one comparable (a token that already trades): log TVL against log market cap. The line is the fitted curve at the median age; the band is the leave-one-out spread.</p>
+    <div id="scatter"></div>
+    <h2>Category offsets</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Category</th><th>Comps</th><th>Offset</th><th>Median multiple</th></tr></thead>
+        <tbody id="cats"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <p>Implied values are this entry's own claim, never make.fun's. A protocol records no token, never that it has none. Built from the sealed snapshot of <span id="asof"></span>; no network, no external assets.</p>
+  </footer>
+</main>
+<script src="../data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

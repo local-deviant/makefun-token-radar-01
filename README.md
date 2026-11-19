@@ -1,116 +1,75 @@
-# Token Radar
+# Token Radar v2
 
 [![make.fun · token-radar-01](https://make.fun/badge/token-radar-01.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![rank](https://make.fun/badge/token-radar-01/local-deviant/makefun-token-radar-01/rank.svg)](https://make.fun/bounty/token-radar-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 [![reward](https://make.fun/badge/token-radar-01/local-deviant/makefun-token-radar-01/reward.svg)](https://make.fun/bounty/token-radar-01?utm_source=github&utm_medium=readme&utm_campaign=token-radar-01)
 
-A token launch radar: screen the snapshot's 758 protocols, fit a value
-model on the tokens that already trade, rank the 198 pre-token protocols
-by implied launch value, and net every farm plan to the dollar with a
-FARM / THIN / SKIP verdict.
+A radar for pre-token protocols: what would a protocol's token be worth if it
+issued one today, and what should a reader do to farm it before it does?
 
-Built from scratch in this session from the sealed kit snapshot
-(`kit/input/snapshot.json`). Node 22, standard library only, deterministic —
-two runs write byte-identical output.
+## What it does
+
+`main.ts` reads the sealed snapshot (`/input/snapshot.json`, 758 protocols as
+of 14 Nov 2026), fits a value model on the protocols that already have a
+token, and writes:
+
+- `board.json` — 197 pre-token protocols ranked by implied value, each with a
+  verdict (FARM / THIN / SKIP) and a six-step farm plan.
+- `dashboard/` — a sortable, filterable board with a detail view per protocol.
+- `screenshots/` — the board, a protocol's detail view, and a filtered view.
+- `dossier.json` — the dossier the judge reads, built with the kit's library.
 
 ## The model
 
-`ln(mcap) = 5.637 + 0.675 * ln(TVL) - 0.161 * ln(age_days) + category offset`,
-fitted by ordinary least squares on 109 comps: live tokens whose mcap/TVL
-sits in [0.02, 20], one greatest-TVL protocol per token id. Category offsets
-are mean residuals shrunk by 8 pseudo-observations; the fitted multiple is
-clamped to [0.08, 1.20]. Implied value = TVL x fitted multiple x growth
-multiplier x 0.80 (the 0.80 is a stated pre-token discount, not a fit).
+`ln(mcap) = 5.6374 + 0.6751·ln(TVL) − 0.1607·ln(age)`, fitted by OLS on 109
+comparables: live tokens whose mcap/TVL sits in [0.02, 20], one per token (the
+greatest TVL when a token spans protocols). Each category carries an offset —
+its mean residual, shrunk by n/(n+8). A protocol's implied value is its TVL
+times its fitted multiple (clamped 0.08–1.20) times its growth
+(1 + its 7-day TVL change, clamped −60%…+120%, times 0.3). There is no
+pre-token discount: the guard showed a 0.80 discount only adds downward bias
+and hurts every check, worst out of time.
 
-Growth is `1 + clamp(7-day TVL change, -60%, +120%) x 0.6`. Age is days
-since DefiLlama first tracked the protocol; a protocol with no tracked
-start is given 365 days, and no age under 30 days is used.
+The board holds every protocol on the snapshot's watchlist (40/40) plus the
+other pre-token candidates below the floor, to 197 rows. A candidate is a
+protocol whose DefiLlama record carries no token, that is not a wrapped,
+staked or bridged product, whose category is not Bridge, Canonical Bridge,
+Liquid Staking, Liquid Restaking, Restaked BTC or CEX, whose name ends in no
+version marker, and whose name begins with no exchange's name — the house's
+own watchlist rule, minus the TVL floor. The record is not proof, so the
+board says a protocol *records no token*, never that it has none.
 
-## Out-of-sample validation (computed at build time, see `lib/validate.ts`)
+Verdicts use the house's $50M floor and the farm band (x4.75, one sigma of
+the leave-one-out errors): FARM when the point estimate clears $50M, THIN
+when only the optimistic end of the band clears it, SKIP when even that falls
+short. Farm plans net to the low end of the band: size the position on that,
+not on the headline.
 
-| Check | Geo factor |
-|---|---|
-| Leave-one-out, n=109, curve | x2.77 |
-| LOO, full pipeline (growth + 0.80) | x2.80 |
-| Time split, cut 2024-02-06 (41 train / 41 test) | x2.75 |
-| Walk-forward, pooled, 62 held-out comps | x2.99 |
-| Median-multiple baseline, LOO | x3.70 |
-| TVL-only baseline (predicted mcap = TVL) | x4.24 |
+## Validation (measured on this snapshot)
 
-Bootstrap, 200 draws, seed 20261114: the full-fit top 10 keeps 8.79 of 10 on
-average; rank 1 stays rank 1 in 87% of draws. The LOO log error spread is
-1.55, so farm plans net against a band of x4.71 (65.1% coverage; 90% band
-x10.45). Rank correlation (Spearman) of the LOO predictions with the truth
-is 0.527.
+| Check | v2 | v1 |
+|---|---|---|
+| Leave-one-out, median | x2.61 | x2.80 |
+| Leave-one-out, geometric mean | x3.53 | x3.57 |
+| Leave-one-out, Spearman | 0.525 | 0.527 |
+| Time split (cut 2024-02-06, 41/41) | x2.60 | x2.75 |
+| Walk-forward, pooled (62 held out) | x2.55 | x2.99 |
+| Walk-forward folds | x2.41 / x2.70 / x2.60 | x2.76 / x2.75 / x3.31 |
+| Median-multiple baseline, LOO | x3.70 | x3.70 |
+| TVL-only baseline, LOO | x4.24 | x4.24 |
 
-## Farm economics
-
-slice = implied value x 0.002% (one active farmer's assumed share), netted to
-the low end of the model band (slice / 4.71), less gas fees and less the
-T-bill cost of the capital (4% x hold / 365). Gas is $3 per on-chain action
-plus $1 per extra chain, capped at $8, over 4 actions. Capital is
-$50 / $100 / $150 / $250 by TVL tier; the hold is 60 / 45 / 30 days by age.
-FARM when the net clears $50; THIN when it covers its costs but not the
-hurdle; SKIP when it does not cover its costs. Counts: 53 FARM / 124 THIN /
-21 SKIP. A SKIP plan says so in its first step.
-
-## Kit
-
-Downloaded fresh for this rebuild from `https://make.fun/c/token-radar-01/kit`
-(tarball sha256 `9b7f497ea0958e53fc86db5224c523c058400ba3b4b48454f69c808297db9b98`):
-all manifest files verified against the sha256 manifest in `kit.json`
-(snapshot sha256 `42a71213519479f3a180cc5010cbbf6bd18a2447fa0ad29e4c5122b6c9184393`),
-extracted to `kit/`. (The kit itself is not committed here; the parent
-handles the submission bundle.)
+Bootstrap (200 draws, seed 20261114): the top 10 keeps 8.87 of 10 on average;
+rank 1 stays rank 1 in 86.5% of draws. Farm band x4.75, coverage 66.1%.
 
 ## Run it
 
 ```sh
-mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <path to snapshot.json>
-node scripts/check.mjs out   # local replica of the sealed 7-row gate
+mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input input/snapshot.json
+node scripts/check.mjs out   # the local gate replica: 8/8
 ```
 
-`main.ts` writes `board.json`, `data.js`, `dashboard/validation.json`,
-`dashboard/00-proof.md` (the judge-readable proof file, rendered from the
-computed numbers), copies `dashboard/` and `screenshots/`, and writes
-`dossier.json` with the vendored make.fun library — then rebuilds the dossier
-and refuses a mismatch. The dossier is 1,008,086 bytes, under the gate's
-1.5 MiB cap; the dossier text is 31,802 of 65,536 bytes, every file whole.
-
-## Screenshots
-
-Captured from the built dashboard with headless Chromium via Playwright
-(the managed Hatch Chrome refuses localhost; Playwright's Chromium is the
-path):
-
-1. `1-board.png` — the board, with the verdict column and the hero OOS panel.
-   Captured 1440x1094 (top 10 rows; the 10th row is cut at the bottom edge).
-2. `2-detail.png` — Sentora Curator's detail: model breakdown + netted plan.
-   Captured 1440x1440 so all six farm steps fit under the detail.
-3. `3-filtered.png` — the FARM-only filter (53 of 198 protocols).
-   Captured 1440x1320.
-
-## Files
-
-- `main.ts` — entrypoint, Node 22 stdlib only
-- `lib/types.ts` — shared shapes
-- `lib/snapshot.ts` — reading the snapshot, the rankable rule
-- `lib/fit.ts` — least squares and summary statistics
-- `lib/model.ts` — comparables, the curve, the implied value
-- `lib/farm.ts` — farm plans, costs, verdicts
-- `lib/validate.ts` — leave-one-out, time split, walk-forward, bootstrap
-- `lib/board.ts` — building the board and the readiness score
-- `lib/proof.ts` — rendering the proof file from the computed numbers
-- `vendor/makefun-board.ts` — kit file, copied verbatim
-- `dashboard/index.html`, `dashboard/app.css`, `dashboard/app.js` — the page
-- `scripts/check.mjs` — local replica of the sealed 7-row gate
-- `screenshots/1-board.png`, `2-detail.png`, `3-filtered.png`
-- `board.json`, `dossier.json` — generated from the kit snapshot (in `out/`, not committed)
-- `LICENSE` (MIT), `README.md`, `RESULTS.md`
-
-## License
-
-MIT. See LICENSE.
+Two runs into different directories are byte-identical. Node 22, standard
+library only, no network.
 
 ---
 

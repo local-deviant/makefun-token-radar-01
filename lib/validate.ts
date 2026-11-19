@@ -1,214 +1,192 @@
-/**
- * Out-of-sample validation, computed at build time from the snapshot
- * alone. Nothing here reads the future: every check fits on one part of
- * the comparables and scores on another part it never saw.
- *
- * The headline number is the geometric error factor: exp(median |log
- * error|), so x2.63 means the typical prediction lands within a factor
- * of 2.63 of the truth either way. The checks:
- *
- *   leave-one-out   fit on 108 comps, score the one left out, all 109
- *   time split      fit on protocols tracked before 2024-02-06, score
- *                   the ones tracked after it (42 train / 40 test on the
- *                   dated comps; undated comps sit out this check)
- *   walk-forward    expanding windows at three cuts, pooled over the
- *                   held-out comps
- *   bootstrap       200 resamples of the comps, seed fixed: how often
- *                   the full-fit top 10 keeps its members, and rank 1
- *                   stays rank 1
- *   baselines       the median-multiple rule and the TVL-only rule, on
- *                   the same leave-one-out protocol, so the fit's gain
- *                   over doing nothing clever is visible
- *
- * The farm band is the leave-one-out residual spread: exp(one standard
- * deviation of the log errors), with the share of held-out errors inside
- * it reported as its coverage.
- */
-import { fitCurve, fittedMultiple, growthFactor, PRE_TOKEN_DISCOUNT } from './model.ts';
-import { ageDays } from './snapshot.ts';
-import { mean, median, mulberry32, quantile, spearman, stddev } from './fit.ts';
-import type { Protocol, Snapshot, Validation } from './types.ts';
+// Validation for token-radar-01 v2: leave-one-out, time split, walk-forward,
+// Spearman rank correlation and a bootstrap of the top 10. The model itself
+// lives in lib/model.ts; this file only measures it. Usable two ways:
+//   - as a library: validateAll(snapshot) returns the numbers (main.ts embeds
+//     them in the dashboard data, so the page states measured numbers);
+//   - as a script: node lib/validate.ts [snapshot.json] prints the JSON.
 
-/** The comparables, as the model selects them. */
-export function compsOf(snap: Snapshot): Protocol[] {
-  const best = new Map<string, Protocol>();
-  for (const p of snap.protocols) {
-    if (!p.mcap_usd || p.mcap_usd <= 0) continue;
-    const key = p.gecko_id ?? p.symbol ?? p.slug;
-    const cur = best.get(key);
-    if (!cur || p.tvl_usd > cur.tvl_usd) best.set(key, p);
+import {
+  loadSnapshot,
+  selectComps,
+  fitCurve,
+  impliedValue,
+  looLogErrors,
+  errorFactors,
+  logSd,
+  ageDays,
+  isPreTokenCandidate,
+  type Snapshot,
+  type Protocol,
+  type Curve,
+} from './model.ts';
+
+export interface Validation {
+  as_of: string;
+  n_comps: number;
+  n_dated_comps: number;
+  beta: number[];
+  loo: { median: number; geo: number; spearman: number };
+  time_split: { cut: string; train: number; test: number; median: number; geo: number };
+  walk_forward: { folds: number[]; pooled_median: number; pooled_geo: number };
+  baselines: { median_multiple_loo_median: number; tvl_only_loo_median: number };
+  band: { factor: number; coverage_1sd: number };
+  bootstrap: { draws: number; seed: number; top10_kept_mean: number; rank1_kept_pct: number };
+  age_missing_comps: number;
+}
+
+function spearman(xs: number[], ys: number[]): number {
+  const rank = (arr: number[]): number[] => {
+    const idx = arr.map((v, i) => [v, i] as [number, number]).sort((a, b) => a[0] - b[0]);
+    const r = new Array<number>(arr.length);
+    idx.forEach(([_, i], pos) => {
+      r[i] = pos + 1;
+    });
+    return r;
+  };
+  const rx = rank(xs);
+  const ry = rank(ys);
+  const mx = rx.reduce((a, b) => a + b, 0) / rx.length;
+  const my = ry.reduce((a, b) => a + b, 0) / ry.length;
+  let num = 0;
+  let dx = 0;
+  let dy = 0;
+  for (let i = 0; i < rx.length; i++) {
+    num += (rx[i] - mx) * (ry[i] - my);
+    dx += (rx[i] - mx) ** 2;
+    dy += (ry[i] - my) ** 2;
   }
-  return [...best.values()].filter((p) => {
-    const r = p.mcap_usd! / p.tvl_usd;
-    return r >= 0.02 && r <= 20;
+  return num / Math.sqrt(dx * dy);
+}
+
+function medianOf(xs: number[]): number {
+  const s = [...xs].sort((a, b) => a - b);
+  return s.length % 2 === 1 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2;
+}
+
+// A seeded PRNG (mulberry32) so the bootstrap is deterministic.
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function validateAll(snap: Snapshot): Validation {
+  const asOf = new Date(`${snap.as_of}T00:00:00Z`);
+  const comps = selectComps(snap.protocols);
+  const curve: Curve = fitCurve(comps, asOf);
+
+  // ---- leave-one-out
+  const looErrs = looLogErrors(comps, asOf);
+  const loo = errorFactors(looErrs);
+  const band = Math.exp(logSd(looErrs));
+  const looPredValues: number[] = [];
+  for (const p of comps) {
+    const train = comps.filter((q) => q !== p);
+    const c = fitCurve(train, asOf);
+    looPredValues.push(impliedValue(p, c, asOf));
+  }
+  const spear = spearman(looPredValues, comps.map((p) => p.mcap_usd as number));
+
+  // ---- time split (cut 2024-02-06, dated comps only)
+  const dated = comps.filter((p) => p.listed_at).sort((a, b) => (a.listed_at as string).localeCompare(b.listed_at as string));
+  const cut = '2024-02-06';
+  const tsTrain = dated.filter((p) => (p.listed_at as string) < cut);
+  const tsTest = dated.filter((p) => (p.listed_at as string) >= cut);
+  const tsErrs = tsTest.map((p) => {
+    const c = fitCurve(tsTrain, asOf);
+    return Math.log(impliedValue(p, c, asOf)) - Math.log(p.mcap_usd as number);
   });
-}
+  const ts = errorFactors(tsErrs);
 
-function clamp(x: number, lo: number, hi: number): number {
-  return x < lo ? lo : x > hi ? hi : x;
-}
-
-/** The full pipeline's prediction for one protocol, given a fit: the
- * clamped multiple, the growth factor and the pre-token discount. */
-function pipelineLogValue(
-  fit: ReturnType<typeof fitCurve>,
-  p: Protocol,
-  asOf: string,
-): number {
-  const mult = fittedMultiple(fit, p, asOf);
-  return Math.log(p.tvl_usd * mult * growthFactor(p.change_7d) * PRE_TOKEN_DISCOUNT);
-}
-
-function geoMedian(errs: number[]): number {
-  return Math.exp(median(errs.map((e) => Math.abs(e))));
-}
-
-function geoMean(errs: number[]): number {
-  return Math.exp(mean(errs.map((e) => Math.abs(e))));
-}
-
-/** Leave-one-out over the comparables, curve alone and full pipeline. */
-function leaveOneOut(comps: Protocol[], asOf: string): { curve: number[]; full: number[] } {
-  const curve: number[] = [];
-  const full: number[] = [];
-  for (let i = 0; i < comps.length; i++) {
-    const train = comps.filter((_, j) => j !== i);
-    const fit = fitCurve(train, asOf);
-    const held = comps[i];
-    const truth = Math.log(held.mcap_usd!);
-    const predCurve =
-      fit.intercept +
-      fit.tvlSlope * Math.log(held.tvl_usd) +
-      fit.ageSlope * Math.log(ageDays(held, asOf, 365)) +
-      (fit.offsets[held.category ?? 'Unknown'] ?? 0);
-    curve.push(truth - predCurve);
-    full.push(truth - pipelineLogValue(fit, held, asOf));
-  }
-  return { curve, full };
-}
-
-/** Time split at a listed_at cut: fit before it, score on or after it. */
-function timeSplit(comps: Protocol[], asOf: string, cut: string): { errs: number[]; train: number; test: number } {
-  const train = comps.filter((p) => p.listed_at !== null && p.listed_at < cut);
-  const test = comps.filter((p) => p.listed_at !== null && p.listed_at >= cut);
-  const fit = fitCurve(train, asOf);
-  const errs = test.map((p) => Math.log(p.mcap_usd!) - pipelineLogValue(fit, p, asOf));
-  return { errs, train: train.length, test: test.length };
-}
-
-/** Walk-forward: expanding windows at three cuts, with disjoint test
- * folds — each fold scores only the comparables first tracked between
- * its cut and the next cut, so no held-out comparable is counted twice. */
-function walkForward(
-  comps: Protocol[],
-  asOf: string,
-  cuts: string[],
-): { perCut: { cut: string; geo: number; n: number }[]; pooledGeo: number; pooledN: number } {
-  const perCut: { cut: string; geo: number; n: number }[] = [];
-  const pooled: number[] = [];
-  for (let c = 0; c < cuts.length; c++) {
-    const cut = cuts[c];
-    const next = c + 1 < cuts.length ? cuts[c + 1] : null;
-    const train = comps.filter((p) => p.listed_at !== null && p.listed_at < cut);
-    const test = comps.filter(
-      (p) => p.listed_at !== null && p.listed_at >= cut && (next === null || p.listed_at < next),
-    );
-    if (train.length < 10 || test.length === 0) continue;
-    const fit = fitCurve(train, asOf);
-    const errs = test.map((p) => Math.log(p.mcap_usd!) - pipelineLogValue(fit, p, asOf));
-    perCut.push({ cut, geo: geoMedian(errs), n: test.length });
-    pooled.push(...errs);
-  }
-  return { perCut, pooledGeo: geoMedian(pooled), pooledN: pooled.length };
-}
-
-/** Bootstrap stability of the full fit's top 10, 200 resamples. */
-function bootstrap(
-  comps: Protocol[],
-  snap: Snapshot,
-  asOf: string,
-  draws: number,
-  seed: number,
-): { top10: number; rank1: number } {
-  const full = fitCurve(comps, asOf);
-  const rankable = snap.protocols.filter(
-    (p) => p.gecko_id === null && p.symbol === null,
-  );
-  const score = (p: Protocol): number =>
-    p.tvl_usd * fittedMultiple(full, p, asOf) * growthFactor(p.change_7d) * PRE_TOKEN_DISCOUNT;
-  const top = [...rankable].sort((a, b) => score(b) - score(a)).slice(0, 10);
-  const topSlugs = new Set(top.map((p) => p.slug));
-  const rank1 = top[0].slug;
-  const rng = mulberry32(seed);
-  let kept = 0;
-  let first = 0;
-  for (let d = 0; d < draws; d++) {
-    const sample: Protocol[] = [];
-    for (let i = 0; i < comps.length; i++) {
-      sample.push(comps[Math.floor(rng() * comps.length)]);
+  // ---- walk-forward: initial train earliest 20 dated, folds test next 21/20/21
+  const foldSizes = [21, 20, 21];
+  const foldMeds: number[] = [];
+  const wfErrs: number[] = [];
+  {
+    let start = 20;
+    for (const n of foldSizes) {
+      const test = dated.slice(start, start + n);
+      const train = dated.slice(0, start);
+      const c = fitCurve(train, asOf);
+      const errs = test.map((p) => Math.log(impliedValue(p, c, asOf)) - Math.log(p.mcap_usd as number));
+      foldMeds.push(errorFactors(errs).median);
+      wfErrs.push(...errs);
+      start += n;
     }
-    const fit = fitCurve(sample, asOf);
-    const s = (p: Protocol): number =>
-      p.tvl_usd * fittedMultiple(fit, p, asOf) * growthFactor(p.change_7d) * PRE_TOKEN_DISCOUNT;
-    const resampledTop = [...rankable].sort((a, b) => s(b) - s(a)).slice(0, 10);
-    kept += resampledTop.filter((p) => topSlugs.has(p.slug)).length;
-    if (resampledTop[0].slug === rank1) first++;
   }
-  return { top10: kept / draws, rank1: first / draws };
-}
+  const wf = errorFactors(wfErrs);
 
-export function validateModel(snap: Snapshot): Validation {
-  const asOf = snap.as_of;
-  const comps = compsOf(snap);
-  const loo = leaveOneOut(comps, asOf);
-  const split = timeSplit(comps, asOf, '2024-02-06');
-  const wf = walkForward(comps, asOf, ['2022-11-28', '2024-02-06', '2025-04-02']);
-  const boot = bootstrap(comps, snap, asOf, 200, 20261114);
-
-  const sortedAbs = [...loo.full].map((e) => Math.abs(e)).sort((a, b) => a - b);
-  const band = Math.exp(stddev(loo.full));
-  const coverage = loo.full.filter((e) => Math.abs(e) <= Math.log(band)).length / loo.full.length;
-  const band90 = Math.exp(quantile(sortedAbs, 0.9));
-
-  const medianMultiple = (() => {
+  // ---- baselines (LOO): median-multiple and TVL-only
+  function baselineLoo(kind: 'median-multiple' | 'tvl-only'): { median: number; geo: number } {
     const errs: number[] = [];
-    for (let i = 0; i < comps.length; i++) {
-      const train = comps.filter((_, j) => j !== i);
-      const med = median(train.map((p) => Math.log(p.mcap_usd! / p.tvl_usd)));
-      errs.push(Math.log(comps[i].mcap_usd!) - (Math.log(comps[i].tvl_usd) + med));
+    for (let h = 0; h < comps.length; h++) {
+      const train = comps.filter((_, i) => i !== h);
+      let pred: number;
+      if (kind === 'tvl-only') {
+        pred = comps[h].tvl_usd;
+      } else {
+        const mults = train.map((p) => (p.mcap_usd as number) / p.tvl_usd).sort((a, b) => a - b);
+        pred = comps[h].tvl_usd * medianOf(mults);
+      }
+      errs.push(Math.log(pred) - Math.log(comps[h].mcap_usd as number));
     }
-    return geoMedian(errs);
-  })();
-  const tvlOnly = geoMedian(comps.map((p) => Math.log(p.mcap_usd! / p.tvl_usd)));
+    return errorFactors(errs);
+  }
+  const baseMedian = baselineLoo('median-multiple');
+  const baseTvl = baselineLoo('tvl-only');
 
-  const looPred = comps.map((p, i) => {
-    const train = comps.filter((_, j) => j !== i);
-    const fit = fitCurve(train, asOf);
-    return pipelineLogValue(fit, p, asOf);
-  });
-  const looSpearman = spearman(
-    looPred,
-    comps.map((p) => Math.log(p.mcap_usd!)),
-  );
+  // ---- bootstrap: 200 draws, seed 20261114; top-10 overlap with the full-fit board
+  const rng = mulberry32(20261114);
+  const candidates = snap.protocols.filter((p) => isPreTokenCandidate(p));
+  const fullBoard = (() => {
+    const scored = candidates.map((p) => ({ slug: p.slug, v: impliedValue(p, curve, asOf) }));
+    scored.sort((a, b) => b.v - a.v);
+    return scored.slice(0, 10).map((s) => s.slug);
+  })();
+  let top10Kept = 0;
+  let rank1Kept = 0;
+  const DRAWS = 200;
+  for (let d = 0; d < DRAWS; d++) {
+    const sample: Protocol[] = [];
+    for (let i = 0; i < comps.length; i++) sample.push(comps[Math.floor(rng() * comps.length)]);
+    const c = fitCurve(sample, asOf);
+    const scored = candidates.map((p) => ({ slug: p.slug, v: impliedValue(p, c, asOf) }));
+    scored.sort((a, b) => b.v - a.v);
+    const top = scored.slice(0, 10).map((s) => s.slug);
+    top10Kept += top.filter((s) => fullBoard.includes(s)).length;
+    if (top[0] === fullBoard[0]) rank1Kept++;
+  }
+
+  // ---- band coverage: share of LOO errors within +-1 sd
+  const within = looErrs.filter((e) => Math.abs(e) <= logSd(looErrs)).length / looErrs.length;
 
   return {
-    looGeo: geoMean(loo.curve),
-    looMedian: geoMedian(loo.curve),
-    looSpearman,
-    looFullGeo: geoMedian(loo.full),
-    timeSplitGeo: geoMedian(split.errs),
-    timeSplitCut: '2024-02-06',
-    timeSplitTrain: split.train,
-    timeSplitTest: split.test,
-    walkForward: wf.perCut,
-    walkForwardPooled: wf.pooledGeo,
-    walkForwardN: wf.pooledN,
-    bootstrapTop10: boot.top10,
-    bootstrapRank1: boot.rank1,
-    medianMultipleGeo: medianMultiple,
-    tvlOnlyGeo: tvlOnly,
-    band,
-    bandCoverage: coverage,
-    band90,
+    as_of: snap.as_of,
+    n_comps: comps.length,
+    n_dated_comps: dated.length,
+    beta: curve.beta.map((b) => Number(b.toFixed(4))),
+    loo: { median: Number(loo.median.toFixed(2)), geo: Number(loo.geo.toFixed(2)), spearman: Number(spear.toFixed(3)) },
+    time_split: { cut, train: tsTrain.length, test: tsTest.length, median: Number(ts.median.toFixed(2)), geo: Number(ts.geo.toFixed(2)) },
+    walk_forward: { folds: foldMeds.map((f) => Number(f.toFixed(2))), pooled_median: Number(wf.median.toFixed(2)), pooled_geo: Number(wf.geo.toFixed(2)) },
+    baselines: {
+      median_multiple_loo_median: Number(baseMedian.median.toFixed(2)),
+      tvl_only_loo_median: Number(baseTvl.median.toFixed(2)),
+    },
+    band: { factor: Number(band.toFixed(2)), coverage_1sd: Number(within.toFixed(3)) },
+    bootstrap: { draws: DRAWS, seed: 20261114, top10_kept_mean: Number((top10Kept / DRAWS).toFixed(2)), rank1_kept_pct: Number(((rank1Kept / DRAWS) * 100).toFixed(1)) },
+    age_missing_comps: comps.filter((p) => ageDays(p, asOf) === null).length,
   };
+}
+
+// Run as a script: node lib/validate.ts [snapshot.json]
+const isMain = process.argv[1]?.endsWith('validate.ts') ?? false;
+if (isMain) {
+  const snapPath = process.argv[2] ?? '/home/hatch/workspace/makefun/kits/token-radar-01-kit/token-radar-01-kit/input/snapshot.json';
+  const snap = loadSnapshot(snapPath);
+  console.log(JSON.stringify(validateAll(snap), null, 2));
 }
